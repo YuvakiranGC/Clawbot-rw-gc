@@ -742,6 +742,68 @@ async function runAutoSetup() {
   return { ok: true };
 }
 
+/**
+ * Update channel configuration from env vars (runs even if already configured).
+ * This ensures env var changes take effect on restart without requiring a full reset.
+ */
+async function updateChannelConfigFromEnv() {
+  if (!isConfigured()) {
+    return; // Nothing to update yet
+  }
+
+  const channelsHelp = await runCmd(OPENCLAW_NODE, clawArgs(["channels", "add", "--help"]));
+  const helpText = channelsHelp.output || "";
+  const supports = (name) => helpText.includes(name);
+
+  // Update Telegram config if env vars are set
+  if (TELEGRAM_BOT_TOKEN && supports("telegram")) {
+    console.log("[config-sync] Updating Telegram channel config from env vars...");
+    console.log("[config-sync] TELEGRAM_DM_POLICY:", TELEGRAM_DM_POLICY);
+    console.log("[config-sync] TELEGRAM_ALLOW_FROM:", TELEGRAM_ALLOW_FROM || "(not set)");
+
+    const cfgObj = {
+      enabled: true,
+      dmPolicy: TELEGRAM_DM_POLICY,
+      botToken: TELEGRAM_BOT_TOKEN,
+      groupPolicy: "allowlist",
+      streamMode: "partial",
+    };
+
+    if (TELEGRAM_DM_POLICY === "allowlist" && TELEGRAM_ALLOW_FROM) {
+      cfgObj.allowFrom = TELEGRAM_ALLOW_FROM.split(",")
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map(s => /^\d+$/.test(s) ? Number(s) : s);
+    }
+
+    const result = await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "channels.telegram", JSON.stringify(cfgObj)]));
+    console.log("[config-sync] Telegram config update result:", result.code === 0 ? "success" : result.output);
+  }
+
+  // Update Discord config if env vars are set
+  if (DISCORD_BOT_TOKEN && supports("discord")) {
+    console.log("[config-sync] Updating Discord channel config from env vars...");
+    const cfgObj = {
+      enabled: true,
+      token: DISCORD_BOT_TOKEN,
+      groupPolicy: "allowlist",
+      dm: { policy: "open" },
+    };
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "channels.discord", JSON.stringify(cfgObj)]));
+  }
+
+  // Update Slack config if env vars are set
+  if ((SLACK_BOT_TOKEN || SLACK_APP_TOKEN) && supports("slack")) {
+    console.log("[config-sync] Updating Slack channel config from env vars...");
+    const cfgObj = {
+      enabled: true,
+      botToken: SLACK_BOT_TOKEN || undefined,
+      appToken: SLACK_APP_TOKEN || undefined,
+    };
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "channels.slack", JSON.stringify(cfgObj)]));
+  }
+}
+
 app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
   try {
     if (isConfigured()) {
@@ -1197,7 +1259,7 @@ app.use(async (req, res) => {
 let server;
 
 (async () => {
-  // Run auto-setup if InstantClaw env vars are present
+  // Run auto-setup if InstantClaw env vars are present and not yet configured
   if (canAutoSetup() && !isConfigured()) {
     try {
       const result = await runAutoSetup();
@@ -1207,6 +1269,17 @@ let server;
     } catch (err) {
       console.error("[wrapper] Auto-setup failed:", err);
       // Continue anyway - user can still use /setup manually
+    }
+  }
+
+  // Always sync channel config from env vars on restart (even if already configured)
+  // This ensures env var changes (like TELEGRAM_DM_POLICY) take effect without full reset
+  if (isConfigured() && (TELEGRAM_BOT_TOKEN || DISCORD_BOT_TOKEN || SLACK_BOT_TOKEN)) {
+    try {
+      await updateChannelConfigFromEnv();
+      console.log("[wrapper] Channel config synced from env vars");
+    } catch (err) {
+      console.error("[wrapper] Failed to sync channel config:", err);
     }
   }
 
