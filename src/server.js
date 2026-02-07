@@ -57,6 +57,34 @@ const WORKSPACE_DIR =
 // Protect /setup with a user-provided password.
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 
+// ─────────────────────────────────────────────────────────────────────────────
+// InstantClaw Auto-Configuration
+// When these env vars are set, the wrapper auto-configures on startup (no /setup needed).
+// ─────────────────────────────────────────────────────────────────────────────
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN?.trim();
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN?.trim();
+const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN?.trim();
+const SLACK_APP_TOKEN = process.env.SLACK_APP_TOKEN?.trim();
+
+// Model provider API keys (check multiple common env var names)
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY?.trim();
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY?.trim();
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY?.trim();
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim();
+const MOONSHOT_API_KEY = process.env.MOONSHOT_API_KEY?.trim();
+const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY?.trim();
+
+// Optional: explicit auth choice override (defaults to auto-detect based on which key is set)
+const OPENCLAW_AUTH_CHOICE = process.env.OPENCLAW_AUTH_CHOICE?.trim();
+// Optional: default model (e.g., "anthropic/claude-opus-4-5")
+const OPENCLAW_DEFAULT_MODEL = process.env.OPENCLAW_DEFAULT_MODEL?.trim();
+
+// Telegram DM policy: "open" (accept all), "allowlist" (only allowFrom), "pairing" (require approval)
+const TELEGRAM_DM_POLICY = process.env.TELEGRAM_DM_POLICY?.trim() || "open";
+// Comma-separated Telegram user IDs to auto-allow (for allowlist mode)
+// e.g., "123456789,987654321" or "123456789,@username"
+const TELEGRAM_ALLOW_FROM = process.env.TELEGRAM_ALLOW_FROM?.trim();
+
 // Gateway admin token (protects OpenClaw gateway + Control UI).
 // Must be stable across restarts. If not provided via env, persist it in the state dir.
 function resolveGatewayToken() {
@@ -529,6 +557,191 @@ function runCmd(cmd, args, opts = {}) {
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// InstantClaw Auto-Setup
+// Detects env vars and auto-configures OpenClaw on startup (no /setup needed).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Detect which auth provider to use based on available API keys.
+ * Returns { authChoice, apiKey, flag } or null if none found.
+ */
+function detectAuthProvider() {
+  // Priority order: explicit choice > Anthropic > OpenAI > OpenRouter > Gemini > others
+  if (OPENCLAW_AUTH_CHOICE) {
+    // Explicit auth choice - find the matching key
+    const choiceToKey = {
+      "apiKey": ANTHROPIC_API_KEY,
+      "anthropic-api-key": ANTHROPIC_API_KEY,
+      "openai-api-key": OPENAI_API_KEY,
+      "openrouter-api-key": OPENROUTER_API_KEY,
+      "gemini-api-key": GEMINI_API_KEY,
+      "moonshot-api-key": MOONSHOT_API_KEY,
+      "minimax-api": MINIMAX_API_KEY,
+    };
+    const key = choiceToKey[OPENCLAW_AUTH_CHOICE];
+    if (key) {
+      return { authChoice: OPENCLAW_AUTH_CHOICE, apiKey: key };
+    }
+  }
+
+  // Auto-detect based on which key is present
+  if (ANTHROPIC_API_KEY) {
+    return { authChoice: "apiKey", apiKey: ANTHROPIC_API_KEY };
+  }
+  if (OPENAI_API_KEY) {
+    return { authChoice: "openai-api-key", apiKey: OPENAI_API_KEY };
+  }
+  if (OPENROUTER_API_KEY) {
+    return { authChoice: "openrouter-api-key", apiKey: OPENROUTER_API_KEY };
+  }
+  if (GEMINI_API_KEY) {
+    return { authChoice: "gemini-api-key", apiKey: GEMINI_API_KEY };
+  }
+  if (MOONSHOT_API_KEY) {
+    return { authChoice: "moonshot-api-key", apiKey: MOONSHOT_API_KEY };
+  }
+  if (MINIMAX_API_KEY) {
+    return { authChoice: "minimax-api", apiKey: MINIMAX_API_KEY };
+  }
+
+  return null;
+}
+
+/**
+ * Check if we have enough env vars to auto-configure.
+ */
+function canAutoSetup() {
+  const hasChannel = TELEGRAM_BOT_TOKEN || DISCORD_BOT_TOKEN || SLACK_BOT_TOKEN;
+  const hasAuth = detectAuthProvider() !== null;
+  return hasChannel && hasAuth;
+}
+
+/**
+ * Run automatic setup using environment variables.
+ * Called once on startup if env vars are present and not already configured.
+ */
+async function runAutoSetup() {
+  if (isConfigured()) {
+    console.log("[auto-setup] Already configured, skipping.");
+    return { ok: true, skipped: true };
+  }
+
+  if (!canAutoSetup()) {
+    console.log("[auto-setup] Missing required env vars, skipping.");
+    return { ok: false, skipped: true, reason: "missing env vars" };
+  }
+
+  console.log("[auto-setup] Detected InstantClaw env vars, running automatic setup...");
+
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+
+  const auth = detectAuthProvider();
+  if (!auth) {
+    console.error("[auto-setup] No auth provider detected");
+    return { ok: false, reason: "no auth provider" };
+  }
+
+  // Build onboard args
+  const payload = {
+    flow: "quickstart",
+    authChoice: auth.authChoice,
+    authSecret: auth.apiKey,
+  };
+
+  const onboardArgs = buildOnboardArgs(payload);
+  console.log("[auto-setup] Running onboard with auth:", auth.authChoice);
+
+  const onboard = await runCmd(OPENCLAW_NODE, clawArgs(onboardArgs));
+
+  if (onboard.code !== 0 || !isConfigured()) {
+    console.error("[auto-setup] Onboard failed:", onboard.output);
+    return { ok: false, reason: "onboard failed", output: onboard.output };
+  }
+
+  console.log("[auto-setup] Onboard successful, configuring gateway...");
+
+  // Configure gateway settings
+  await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
+  await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
+  await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
+  await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
+
+  // Set default model if specified
+  if (OPENCLAW_DEFAULT_MODEL) {
+    console.log("[auto-setup] Setting default model:", OPENCLAW_DEFAULT_MODEL);
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "agents.defaults.model.primary", OPENCLAW_DEFAULT_MODEL]));
+  }
+
+  // Configure channels
+  const channelsHelp = await runCmd(OPENCLAW_NODE, clawArgs(["channels", "add", "--help"]));
+  const helpText = channelsHelp.output || "";
+  const supports = (name) => helpText.includes(name);
+
+  // Telegram
+  if (TELEGRAM_BOT_TOKEN) {
+    if (supports("telegram")) {
+      console.log("[auto-setup] Configuring Telegram channel with dmPolicy:", TELEGRAM_DM_POLICY);
+      const cfgObj = {
+        enabled: true,
+        dmPolicy: TELEGRAM_DM_POLICY, // "open", "allowlist", or "pairing"
+        botToken: TELEGRAM_BOT_TOKEN,
+        groupPolicy: "allowlist",
+        streamMode: "partial",
+      };
+
+      // If allowlist mode and allowFrom is specified, parse and add user IDs
+      if (TELEGRAM_DM_POLICY === "allowlist" && TELEGRAM_ALLOW_FROM) {
+        // Parse comma-separated values, convert numeric strings to numbers
+        cfgObj.allowFrom = TELEGRAM_ALLOW_FROM.split(",")
+          .map(s => s.trim())
+          .filter(Boolean)
+          .map(s => /^\d+$/.test(s) ? Number(s) : s);
+        console.log("[auto-setup] Telegram allowFrom:", cfgObj.allowFrom);
+      }
+
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "channels.telegram", JSON.stringify(cfgObj)]));
+    } else {
+      console.warn("[auto-setup] Telegram not supported by this OpenClaw build");
+    }
+  }
+
+  // Discord
+  if (DISCORD_BOT_TOKEN) {
+    if (supports("discord")) {
+      console.log("[auto-setup] Configuring Discord channel...");
+      const cfgObj = {
+        enabled: true,
+        token: DISCORD_BOT_TOKEN,
+        groupPolicy: "allowlist",
+        dm: { policy: "pairing" },
+      };
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "channels.discord", JSON.stringify(cfgObj)]));
+    } else {
+      console.warn("[auto-setup] Discord not supported by this OpenClaw build");
+    }
+  }
+
+  // Slack
+  if (SLACK_BOT_TOKEN || SLACK_APP_TOKEN) {
+    if (supports("slack")) {
+      console.log("[auto-setup] Configuring Slack channel...");
+      const cfgObj = {
+        enabled: true,
+        botToken: SLACK_BOT_TOKEN || undefined,
+        appToken: SLACK_APP_TOKEN || undefined,
+      };
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "channels.slack", JSON.stringify(cfgObj)]));
+    } else {
+      console.warn("[auto-setup] Slack not supported by this OpenClaw build");
+    }
+  }
+
+  console.log("[auto-setup] Configuration complete!");
+  return { ok: true };
+}
+
 app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
   try {
     if (isConfigured()) {
@@ -977,31 +1190,55 @@ app.use(async (req, res) => {
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
-const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`[wrapper] listening on :${PORT}`);
-  console.log(`[wrapper] state dir: ${STATE_DIR}`);
-  console.log(`[wrapper] workspace dir: ${WORKSPACE_DIR}`);
-  console.log(`[wrapper] gateway token: ${OPENCLAW_GATEWAY_TOKEN ? "(set)" : "(missing)"}`);
-  console.log(`[wrapper] gateway target: ${GATEWAY_TARGET}`);
-  if (!SETUP_PASSWORD) {
-    console.warn("[wrapper] WARNING: SETUP_PASSWORD is not set; /setup will error.");
-  }
-  // Don't start gateway unless configured; proxy will ensure it starts.
-});
+// ─────────────────────────────────────────────────────────────────────────────
+// Server Startup with InstantClaw Auto-Setup
+// ─────────────────────────────────────────────────────────────────────────────
 
-server.on("upgrade", async (req, socket, head) => {
-  if (!isConfigured()) {
-    socket.destroy();
-    return;
+let server;
+
+(async () => {
+  // Run auto-setup if InstantClaw env vars are present
+  if (canAutoSetup() && !isConfigured()) {
+    try {
+      const result = await runAutoSetup();
+      if (result.ok && !result.skipped) {
+        console.log("[wrapper] InstantClaw auto-setup completed successfully!");
+      }
+    } catch (err) {
+      console.error("[wrapper] Auto-setup failed:", err);
+      // Continue anyway - user can still use /setup manually
+    }
   }
-  try {
-    await ensureGatewayRunning();
-  } catch {
-    socket.destroy();
-    return;
-  }
-  proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
-});
+
+  server = app.listen(PORT, "0.0.0.0", () => {
+    console.log(`[wrapper] listening on :${PORT}`);
+    console.log(`[wrapper] state dir: ${STATE_DIR}`);
+    console.log(`[wrapper] workspace dir: ${WORKSPACE_DIR}`);
+    console.log(`[wrapper] gateway token: ${OPENCLAW_GATEWAY_TOKEN ? "(set)" : "(missing)"}`);
+    console.log(`[wrapper] gateway target: ${GATEWAY_TARGET}`);
+    if (canAutoSetup()) {
+      console.log(`[wrapper] InstantClaw mode: enabled (env vars detected)`);
+    }
+    if (!SETUP_PASSWORD && !canAutoSetup()) {
+      console.warn("[wrapper] WARNING: SETUP_PASSWORD is not set; /setup will error.");
+    }
+    // Don't start gateway unless configured; proxy will ensure it starts.
+  });
+
+  server.on("upgrade", async (req, socket, head) => {
+    if (!isConfigured()) {
+      socket.destroy();
+      return;
+    }
+    try {
+      await ensureGatewayRunning();
+    } catch {
+      socket.destroy();
+      return;
+    }
+    proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
+  });
+})();
 
 process.on("SIGTERM", () => {
   // Best-effort shutdown
